@@ -19,6 +19,7 @@ import traceback
 from collections import Counter, OrderedDict
 from ipaddr import AddressValueError, IPv4Address, IPv4Network
 from ipaddr_ext import IPv4Range
+import itertools
 from itertools import product
 
 
@@ -280,6 +281,43 @@ class Rule:
             return self._dnat(params)
         else:
             raise RuleException('Key error: invalid rule type \'{0}\'.'.format(self.params['rtype']))
+
+    def get_klint_rule(self):
+        params = self.params
+        if params['from_alias'] == 'local' or params['to_alias'] == 'local':
+            raise RuleException("Local rules not supported")
+
+        def get_ip(direction):
+            intf_alias = '{0}_alias'.format(direction)
+            intf = '{0}_intf'.format(direction)
+            ip = '{0}_ip'.format(direction)
+            if params[ip]:
+                if isinstance(params[ip], IPv4Network):
+                    return params[ip]
+                if isinstance(params[ip], IPv4Address):
+                    return IPv4Network(f'{params[ip]}/32')
+                return None
+            if params[intf_alias]:
+                return self.mignis.intf[params[intf_alias]][1]
+            return IPv4Network('0.0.0.0/0')
+
+        def get_ports(direction):
+            port = '{0}_port'.format(direction)
+            if not params[port] or len(params[port]) == 0:
+                return [0]
+            if len(params[port]) == 1:
+                return params[port]
+            return list(range(params[port][0], params[port][1]+1))
+
+
+        from_ip = get_ip("from")
+        to_ip = get_ip("to")
+
+        from_ports = get_ports("from")
+        to_ports = get_ports("to")
+
+        rules = [KlintRule(from_ip, to_ip, from_port, to_port, self.params['rtype']) for (from_port, to_port) in product(from_ports, to_ports)]
+        return rules
 
     @staticmethod
     def ip_isinside(a, b):
@@ -630,6 +668,16 @@ class MignisException(Exception):
 class MignisConfigException(Exception):
     pass
 
+class KlintRule:
+    def __init__(self, src_prefix, dst_prefix, src_port, dst_port, rule_type):
+        self.src_prefix = src_prefix
+        self.dst_prefix = dst_prefix
+        self.src_port = src_port
+        self.dst_port = dst_port
+        self.rule_type = rule_type
+
+    def __repr__(self) -> str:
+        return f'{self.src_prefix}:{self.src_port} {self.rule_type} {self.dst_prefix}:{self.dst_port}'
 
 class Mignis:
     old_rules = []
@@ -1522,6 +1570,86 @@ class Mignis:
         except MignisConfigException as e:
             raise MignisException(self, 'Error in configuration file:\n' + str(e))
 
+
+    def klint_write_rules(self, f, rules, prefix_indexes):
+        # Write handles
+        for (prefix, index) in prefix_indexes.items():
+            handle = index + 1
+            f.write(f"-- {prefix} {handle}\n")
+
+            packet = ((0).to_bytes(1, "little")
+                      + prefix.packed
+                      + prefix.prefixlen.to_bytes(1, "little")
+                      + handle.to_bytes(2, "little"))
+            serialised = repr(list(packet))
+            serialised = "{" + serialised[1:-1] +  "}"
+            f.write(serialised)
+            f.write("\n\n")
+
+        for rule in rules:
+            f.write(f"-- {rule}\n")
+
+            src_handle = prefix_indexes[rule.src_prefix] + 1
+            dst_handle = prefix_indexes[rule.dst_prefix] + 1
+            rule_type = int(rule.rule_type == ">")
+            packet = ((1).to_bytes(1, "little")
+                      + src_handle.to_bytes(2, "little")
+                      + dst_handle.to_bytes(2, "little")
+                      + rule.src_port.to_bytes(2, "little")
+                      + rule.dst_port.to_bytes(2, "little")
+                      + rule_type.to_bytes(1, "little")
+                      + (0).to_bytes(1, "little"))
+            serialised = repr(list(packet))
+            serialised = "{" + serialised[1:-1] +  "}"
+            f.write(serialised)
+            f.write("\n\n")
+
+    def klint_firewall_config(self, out_path):
+        all_ruletype = ['/', '//', '<>', '>', '>D', '>M', '>S', '{']
+        supported_ruletype = ['/', '>']
+
+        self.wr('\n\n## Klint Rules')
+
+        # Rules optimization
+        self.fw_rulesdict = self.pre_optimize_rules(self.fw_rulesdict)
+
+        # Check for unsupported rule types
+        unsupported_ruletype = filter(lambda x: x not in supported_ruletype, all_ruletype)
+        for ruletype in unsupported_ruletype:
+            if len(self.fw_rulesdict[ruletype]) != 0:
+                self.wr(f'{ruletype} is not supported')
+                return
+
+        def get_klint_rule(rule):
+            # Debugging info
+            if self.debug >= 2:
+                print('\n# [D]\n' + str(rule))
+            if self.debug >= 1:
+                print('\n# ' + rule.params['abstract'])
+            return rule.get_klint_rule()
+
+        rule_dicts = itertools.chain.from_iterable(
+            self.fw_rulesdict[ruletype] for ruletype in supported_ruletype for rule in self.fw_rulesdict[ruletype])
+        klint_rules = list(itertools.chain.from_iterable(get_klint_rule(r) for r in rule_dicts))
+
+        prefixes = sorted(list(set(itertools.chain.from_iterable((r.src_prefix, r.dst_prefix) for r in klint_rules))))
+        prefix_indexes = dict((prefix, i) for (i, prefix) in enumerate(prefixes))
+
+        def get_subnets(prefix):
+            starting_idx = prefix_indexes[prefix]
+            return itertools.takewhile(lambda p: p in prefix, prefixes[starting_idx:])
+
+        def expand_rules(rule):
+            pairs = list(itertools.product(get_subnets(rule.src_prefix), get_subnets(rule.dst_prefix)))
+            return (KlintRule(src, dst, rule.src_port, rule.dst_port, rule.rule_type) for (src, dst) in pairs)
+
+        expanded_rules = list(itertools.chain.from_iterable(expand_rules(rule) for rule in klint_rules))
+
+        if out_path:
+            with open(out_path, "wt", encoding="utf-8") as f:
+                self.klint_write_rules(f, expanded_rules, prefix_indexes)
+            print('\n[*] Rules written.')
+
 # Argument parsing
 
 
@@ -1540,6 +1668,8 @@ def parse_args():
     config_group = config_group.add_mutually_exclusive_group(required=False)
     config_group.add_argument('-w', '--write', dest='write_rules_filename', metavar='filename',
                               help='write the rules to file', required=False)
+    config_group.add_argument('-k', '--klint', dest='klint_rules_filename', metavar='filename',
+                              help='write the klint rules to file', required=False)
     config_group.add_argument('-e', '--execute', dest='execute_rules', 
                               help='execute the rules without writing to file', required=False, 
                               action='store_true')
@@ -1557,7 +1687,7 @@ def parse_args():
         parser.error('argument -F/--flush: not allowed with argument -c/--config')
     elif not args['config_file'] and not args['flush']:
         parser.error('error: one of the arguments -F/--flush -c/--config is required')
-    if args['config_file'] and not any((args['write_rules_filename'], args['execute_rules'], args['query_rules'])):
+    if args['config_file'] and not any((args['write_rules_filename'], args['execute_rules'], args['query_rules'], args['klint_rules_filename'])):
         parser.error('error: one of the arguments -w/--write -e/--execute -q/--query is required')
     return args
 
@@ -1571,6 +1701,8 @@ def main():
 
         if args['query_rules']:
             mignis.query_rules(args['query_rules'])
+        elif args['klint_rules_filename']:
+            mignis.klint_firewall_config(args['klint_rules_filename'])
         else:
             mignis.all_rules()
             mignis.apply_rules()

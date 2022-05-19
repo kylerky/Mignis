@@ -692,7 +692,7 @@ class KlintRule:
 
     def __repr__(self) -> str:
         tcpudp_str = ""
-        if self.tcpudp == None:
+        if self.tcpudp == 0:
             tcpudp_str = "tcp/udp"
         elif self.tcpudp == 1:
             tcpudp_str = "tcp"
@@ -1656,8 +1656,7 @@ class Mignis:
                 print('\n# ' + rule.params['abstract'])
             return rule.get_klint_rule()
 
-        rule_dicts = itertools.chain.from_iterable(
-            self.fw_rulesdict[ruletype] for ruletype in supported_ruletype for rule in self.fw_rulesdict[ruletype])
+        rule_dicts = (rule for ruletype in supported_ruletype for rule in self.fw_rulesdict[ruletype])
         klint_rules = list(flatmap(get_klint_rule, rule_dicts))
 
         prefixes = sorted(list(set(itertools.chain.from_iterable((r.src_prefix, r.dst_prefix) for r in klint_rules))))

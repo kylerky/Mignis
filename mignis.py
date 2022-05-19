@@ -1688,7 +1688,7 @@ class Mignis:
         expanded_rules = flatmap(expand_rules_port, expanded_rules)
         expanded_rules = flatmap(expand_rules_tcpudp, expanded_rules)
 
-        if out_path:
+        if out_path and not self.dryrun:
             with open(out_path, "wt", encoding="utf-8") as f:
                 self.klint_write_rules(f, expanded_rules, prefix_indexes)
             print('\n[*] Rules written.')

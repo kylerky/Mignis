@@ -15,13 +15,17 @@ import re
 import sys
 import tempfile
 import traceback
+import copy
+import itertools
 
 from collections import Counter, OrderedDict
 from ipaddr import AddressValueError, IPv4Address, IPv4Network
 from ipaddr_ext import IPv4Range
-import itertools
 from itertools import product
 
+
+def flatmap(f, iterable):
+    return itertools.chain.from_iterable(f(x) for x in iterable)
 
 class RuleException(Exception):
     pass
@@ -316,7 +320,16 @@ class Rule:
         from_ports = get_ports("from")
         to_ports = get_ports("to")
 
-        rules = [KlintRule(from_ip, to_ip, from_port, to_port, self.params['rtype']) for (from_port, to_port) in product(from_ports, to_ports)]
+        tcpudp = 0
+        if self.params['protocol'] is not None:
+            if self.params['protocol'] == 'tcp':
+                tcpudp = 1
+            elif self.params['protocol'] == 'udp':
+                tcpudp = 2
+            else:
+                raise RuleException(f"Unsupported protocol {self.params['protocol']}")
+
+        rules = [KlintRule(from_ip, to_ip, from_ports, to_ports, self.params['rtype'], tcpudp)]
         return rules
 
     @staticmethod
@@ -669,15 +682,24 @@ class MignisConfigException(Exception):
     pass
 
 class KlintRule:
-    def __init__(self, src_prefix, dst_prefix, src_port, dst_port, rule_type):
+    def __init__(self, src_prefix, dst_prefix, src_ports, dst_ports, rule_type, tcpudp):
         self.src_prefix = src_prefix
         self.dst_prefix = dst_prefix
-        self.src_port = src_port
-        self.dst_port = dst_port
+        self.src_ports = src_ports
+        self.dst_ports = dst_ports
         self.rule_type = rule_type
+        self.tcpudp = tcpudp
 
     def __repr__(self) -> str:
-        return f'{self.src_prefix}:{self.src_port} {self.rule_type} {self.dst_prefix}:{self.dst_port}'
+        tcpudp_str = ""
+        if self.tcpudp == None:
+            tcpudp_str = "tcp/udp"
+        elif self.tcpudp == 1:
+            tcpudp_str = "tcp"
+        elif self.tcpudp == 2:
+            tcpudp_str = "udp"
+
+        return f'{self.src_prefix}:{self.src_ports} {self.rule_type} {self.dst_prefix}:{self.dst_ports} {tcpudp_str}'
 
 class Mignis:
     old_rules = []
@@ -1592,11 +1614,17 @@ class Mignis:
             src_handle = prefix_indexes[rule.src_prefix] + 1
             dst_handle = prefix_indexes[rule.dst_prefix] + 1
             rule_type = int(rule.rule_type == ">")
+
+            if rule.tcpudp == 1:
+                rule_type |= 2
+            elif rule.tcpudp != 2:
+                raise MignisException(self, "Unknown protocol type")
+
             packet = ((1).to_bytes(1, "little")
                       + src_handle.to_bytes(2, "little")
                       + dst_handle.to_bytes(2, "little")
-                      + rule.src_port.to_bytes(2, "little")
-                      + rule.dst_port.to_bytes(2, "little")
+                      + rule.src_ports.to_bytes(2, "little")
+                      + rule.dst_ports.to_bytes(2, "little")
                       + rule_type.to_bytes(1, "little")
                       + (0).to_bytes(1, "little"))
             serialised = repr(list(packet))
@@ -1630,7 +1658,7 @@ class Mignis:
 
         rule_dicts = itertools.chain.from_iterable(
             self.fw_rulesdict[ruletype] for ruletype in supported_ruletype for rule in self.fw_rulesdict[ruletype])
-        klint_rules = list(itertools.chain.from_iterable(get_klint_rule(r) for r in rule_dicts))
+        klint_rules = list(flatmap(get_klint_rule, rule_dicts))
 
         prefixes = sorted(list(set(itertools.chain.from_iterable((r.src_prefix, r.dst_prefix) for r in klint_rules))))
         prefix_indexes = dict((prefix, i) for (i, prefix) in enumerate(prefixes))
@@ -1639,11 +1667,26 @@ class Mignis:
             starting_idx = prefix_indexes[prefix]
             return itertools.takewhile(lambda p: p in prefix, prefixes[starting_idx:])
 
-        def expand_rules(rule):
-            pairs = list(itertools.product(get_subnets(rule.src_prefix), get_subnets(rule.dst_prefix)))
-            return (KlintRule(src, dst, rule.src_port, rule.dst_port, rule.rule_type) for (src, dst) in pairs)
+        def expand_rules_subnet(rule):
+            pairs = itertools.product(get_subnets(rule.src_prefix), get_subnets(rule.dst_prefix))
+            return (KlintRule(src, dst, rule.src_ports, rule.dst_ports, rule.rule_type, rule.tcpudp) for (src, dst) in pairs)
 
-        expanded_rules = list(itertools.chain.from_iterable(expand_rules(rule) for rule in klint_rules))
+        def expand_rules_port(rule):
+            pairs = itertools.product(rule.src_ports, rule.dst_ports)
+            return (KlintRule(rule.src_prefix, rule.dst_prefix, src, dst, rule.rule_type, rule.tcpudp) for (src, dst) in pairs)
+
+        def expand_rules_tcpudp(rule):
+            if rule.tcpudp != 0:
+                return [rule]
+
+            rules = [copy.copy(rule), copy.copy(rule)]
+            rules[0].tcpudp = 1
+            rules[1].tcpudp = 2
+            return rules
+
+        expanded_rules = flatmap(expand_rules_subnet, klint_rules)
+        expanded_rules = flatmap(expand_rules_port, expanded_rules)
+        expanded_rules = flatmap(expand_rules_tcpudp, expanded_rules)
 
         if out_path:
             with open(out_path, "wt", encoding="utf-8") as f:
